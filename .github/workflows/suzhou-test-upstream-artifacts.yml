@@ -1,0 +1,249 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Suzhou Test Upstream Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: "Upstream ROCm/TheRock workflow run ID to download artifacts from"
+        type: string
+        default: "28060350357"
+      artifact_repository:
+        description: "GitHub repository that produced the artifacts"
+        type: string
+        default: "ROCm/TheRock"
+      amdgpu_family:
+        description: "Artifact group / AMDGPU family to install"
+        type: string
+        default: "gfx1151"
+      amdgpu_targets:
+        description: "Comma-separated GPU targets to fetch"
+        type: string
+        default: "gfx1151"
+      test_component:
+        description: "TheRock test component job name"
+        type: string
+        default: "rocblas"
+      test_type:
+        description: "TheRock test type"
+        type: choice
+        options:
+          - quick
+          - standard
+          - comprehensive
+          - full
+        default: quick
+      shard_index:
+        description: "GTest shard index"
+        type: string
+        default: "1"
+      total_shards:
+        description: "Total GTest shards"
+        type: string
+        default: "1"
+      fetch_artifact_args:
+        description: "Extra artifact install flags"
+        type: string
+        default: "--blas --tests"
+      runner_label:
+        description: "Suzhou self-hosted GPU runner label"
+        type: string
+        default: "linux-gfx1151-gpu-rocm"
+
+permissions:
+  contents: read
+
+jobs:
+  test_upstream_artifacts:
+    name: Test ${{ inputs.test_component }} ${{ inputs.test_type }} (${{ inputs.amdgpu_family }})
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      VENV_DIR: ${{ github.workspace }}/.venv
+      OUTPUT_ARTIFACTS_DIR: ${{ github.workspace }}/build
+      THEROCK_BIN_DIR: ${{ github.workspace }}/build/bin
+      ROCM_PATH: ${{ github.workspace }}/build
+      LOG_DIR: ${{ github.workspace }}/suzhou-ci-logs
+      ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+      ARTIFACT_REPOSITORY: ${{ inputs.artifact_repository }}
+      ARTIFACT_GROUP: ${{ inputs.amdgpu_family }}
+      AMDGPU_FAMILIES: ${{ inputs.amdgpu_family }}
+      AMDGPU_TARGETS: ${{ inputs.amdgpu_targets }}
+      TEST_COMPONENT: ${{ inputs.test_component }}
+      TEST_TYPE: ${{ inputs.test_type }}
+      SHARD_INDEX: ${{ inputs.shard_index }}
+      TOTAL_SHARDS: ${{ inputs.total_shards }}
+      FETCH_ARTIFACT_ARGS: ${{ inputs.fetch_artifact_args }}
+      OPENBLAS_NUM_THREADS: "14"
+      OMP_NUM_THREADS: "14"
+      ROCM_KPACK_DEBUG: "1"
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          uv --version
+
+      - name: Prepare log directory
+        run: |
+          rm -rf "${LOG_DIR}" "${OUTPUT_ARTIFACTS_DIR}"
+          mkdir -p "${LOG_DIR}"
+          {
+            echo "date_utc=$(date -u --iso-8601=seconds)"
+            echo "github_repository=${GITHUB_REPOSITORY}"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "artifact_repository=${ARTIFACT_REPOSITORY}"
+            echo "artifact_run_id=${ARTIFACT_RUN_ID}"
+            echo "artifact_group=${ARTIFACT_GROUP}"
+            echo "amdgpu_targets=${AMDGPU_TARGETS}"
+            echo "test_component=${TEST_COMPONENT}"
+            echo "test_type=${TEST_TYPE}"
+            echo "shard_index=${SHARD_INDEX}"
+            echo "total_shards=${TOTAL_SHARDS}"
+          } | tee "${LOG_DIR}/workflow-context.txt"
+          env | sort > "${LOG_DIR}/environment.txt"
+
+      - name: Preflight GPU device check
+        run: |
+          set -o pipefail
+          {
+            echo "== uname =="
+            uname -a
+            echo
+            echo "== identity =="
+            id
+            groups
+            echo
+            echo "== GPU device nodes =="
+            ls -l /dev/kfd /dev/dri || true
+          } | tee "${LOG_DIR}/preflight.txt"
+          test -e /dev/kfd
+          test -d /dev/dri
+
+      - name: Create Python venv
+        run: |
+          python build_tools/setup_venv.py "${VENV_DIR}" \
+            --activate-in-future-github-actions-steps \
+            --use-uv
+
+      - name: Install test requirements
+        run: |
+          uv pip install -r requirements-test.txt
+          uv pip freeze | tee "${LOG_DIR}/python-freeze.txt"
+
+      - name: Download and unpack upstream artifacts
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          python ./build_tools/install_rocm_from_artifacts.py \
+            --run-id="${ARTIFACT_RUN_ID}" \
+            --run-github-repo="${ARTIFACT_REPOSITORY}" \
+            --artifact-group="${ARTIFACT_GROUP}" \
+            --amdgpu-targets="${AMDGPU_TARGETS}" \
+            --output-dir="${OUTPUT_ARTIFACTS_DIR}" \
+            ${FETCH_ARTIFACT_ARGS} \
+            2>&1 | tee "${LOG_DIR}/install-artifacts.log"
+
+      - name: Configure ROCm artifact environment
+        run: |
+          echo "${THEROCK_BIN_DIR}" >> "$GITHUB_PATH"
+          {
+            echo "THEROCK_BIN_DIR=${THEROCK_BIN_DIR}"
+            echo "OUTPUT_ARTIFACTS_DIR=${OUTPUT_ARTIFACTS_DIR}"
+            echo "ROCM_PATH=${ROCM_PATH}"
+            echo "LD_LIBRARY_PATH=${ROCM_PATH}/lib:${ROCM_PATH}/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate installed artifact structure
+        run: |
+          set -o pipefail
+          {
+            echo "== top-level artifact directory =="
+            ls -la "${OUTPUT_ARTIFACTS_DIR}"
+            echo
+            echo "== bin directory =="
+            ls -la "${THEROCK_BIN_DIR}"
+            echo
+            echo "== rocBLAS test directory =="
+            ls -la "${THEROCK_BIN_DIR}/rocblas"
+          } | tee "${LOG_DIR}/artifact-structure.txt"
+          test -x "${THEROCK_BIN_DIR}/rocminfo"
+          test -f "${THEROCK_BIN_DIR}/rocblas/CTestTestfile.cmake"
+          python - <<'PY' > "${LOG_DIR}/artifact-tree.txt"
+          from pathlib import Path
+
+          root = Path("build")
+          for path in sorted(root.rglob("*")):
+              rel = path.relative_to(root)
+              if len(rel.parts) > 4:
+                  continue
+              print(rel)
+          PY
+
+      - name: ROCm runtime sanity check
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          "${THEROCK_BIN_DIR}/rocminfo" 2>&1 | tee "${LOG_DIR}/rocminfo.txt"
+          grep -E "Name:.*${ARTIFACT_GROUP}|Marketing Name:" "${LOG_DIR}/rocminfo.txt"
+
+      - name: Run TheRock component test
+        id: component_test
+        timeout-minutes: 180
+        run: |
+          set -o pipefail
+          python build_tools/github_actions/test_executable_scripts/test_runner.py \
+            2>&1 | tee "${LOG_DIR}/test-runner.log"
+
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            echo "## Suzhou Upstream Artifact Test"
+            echo
+            echo "- Artifact repository: \`${ARTIFACT_REPOSITORY}\`"
+            echo "- Artifact run ID: \`${ARTIFACT_RUN_ID}\`"
+            echo "- AMDGPU family: \`${ARTIFACT_GROUP}\`"
+            echo "- AMDGPU targets: \`${AMDGPU_TARGETS}\`"
+            echo "- Test component: \`${TEST_COMPONENT}\`"
+            echo "- Test type: \`${TEST_TYPE}\`"
+            echo "- Shard: \`${SHARD_INDEX}/${TOTAL_SHARDS}\`"
+            echo
+            echo "### Key checks"
+            echo
+            if [[ -f "${LOG_DIR}/rocminfo.txt" ]]; then
+              grep -E "Name:.*${ARTIFACT_GROUP}|Marketing Name:" "${LOG_DIR}/rocminfo.txt" || true
+            fi
+            echo
+            if [[ -f "${LOG_DIR}/test-runner.log" ]]; then
+              grep -E "tests passed|tests failed|rocblas-test_.*Passed|Total Test time" "${LOG_DIR}/test-runner.log" || true
+            fi
+          } | tee "${LOG_DIR}/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Suzhou CI logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suzhou-upstream-artifact-logs-${{ inputs.artifact_run_id }}-${{ inputs.test_component }}-${{ inputs.test_type }}
+          path: suzhou-ci-logs/
+          if-no-files-found: ignore
+          retention-days: 30
