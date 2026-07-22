@@ -51,7 +51,7 @@ jobs:
     timeout-minutes: 300
     defaults:
       run:
-        shell: pwsh
+        shell: powershell
 
     steps:
       - name: Show controller state
@@ -59,7 +59,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           Write-Host "Controller: $env:COMPUTERNAME"
           ssh -V
-          scp -V
+          Get-Command scp
 
       - name: Check GMK host state
         run: |
