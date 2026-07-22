@@ -71,23 +71,8 @@ jobs:
         if: inputs.mode == 'auto'
         run: |
           $ErrorActionPreference = "Stop"
-          $script = @'
-          set -euxo pipefail
-          cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression
-          sudo systemd-run \
-            --unit rocm-kernel-regression-start \
-            --collect \
-            --working-directory /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression \
-            /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression/scripts/orchestrate_kernel_matrix.py \
-              start \
-              --config "${{ inputs.config }}" \
-              --ci \
-              --force
-          '@
-          $localScript = "gmk-start-kernel-matrix.sh"
-          $script | Set-Content -Path $localScript -Encoding ascii
-          scp $localScript "${{ inputs.target_user }}@${{ inputs.target_host }}:/tmp/$localScript"
-          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" "bash /tmp/$localScript"
+          $remote = "cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression && sudo systemd-run --unit rocm-kernel-regression-start --collect --working-directory /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression/scripts/orchestrate_kernel_matrix.py start --config '${{ inputs.config }}' --ci --force"
+          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" $remote
 
       - name: Wait for GMK completion
         if: inputs.mode == 'auto'
@@ -129,26 +114,8 @@ jobs:
         if: inputs.mode == 'auto'
         run: |
           $ErrorActionPreference = "Stop"
-          $script = @'
-          set -euxo pipefail
-          cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression
-          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-github-collect"
-          mkdir -p "reports/${RUN_ID}"
-          STATE_ARGS=()
-          if [ -f ./state/current-run.json ]; then
-            STATE_ARGS=(--state ./state/current-run.json)
-          fi
-          python3 ./scripts/summarize_matrix.py \
-            --config "${{ inputs.config }}" \
-            "${STATE_ARGS[@]}" \
-            --output-dir "reports/${RUN_ID}"
-          rm -f reports/latest
-          ln -s "${RUN_ID}" reports/latest
-          '@
-          $localScript = "gmk-refresh-report.sh"
-          $script | Set-Content -Path $localScript -Encoding ascii
-          scp $localScript "${{ inputs.target_user }}@${{ inputs.target_host }}:/tmp/$localScript"
-          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" "bash /tmp/$localScript"
+          $remote = "cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression && RUN_ID=`$(date -u +%Y%m%dT%H%M%SZ)-github-collect && mkdir -p reports/`$RUN_ID && if [ -f ./state/current-run.json ]; then python3 ./scripts/summarize_matrix.py --config '${{ inputs.config }}' --state ./state/current-run.json --output-dir reports/`$RUN_ID; else python3 ./scripts/summarize_matrix.py --config '${{ inputs.config }}' --output-dir reports/`$RUN_ID; fi && rm -f reports/latest && ln -s `$RUN_ID reports/latest"
+          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" $remote
 
       - name: Download reports from GMK
         if: inputs.mode == 'auto'
