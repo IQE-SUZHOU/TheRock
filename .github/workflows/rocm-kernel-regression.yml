@@ -9,29 +9,37 @@ on:
       mode:
         description: "Operation mode"
         required: true
-        default: "start"
+        default: "auto"
         type: choice
         options:
-          - start
-          - wait
-          - collect
+          - auto
           - status
           - abort
       runner_label:
-        description: "Self-hosted runner label"
+        description: "Controller self-hosted runner label"
         required: true
         type: string
-        default: "linux-gfx1151-gpu-rocm"
+        default: "gmk-controller"
+      target_host:
+        description: "GMK EVO-X2 SSH host"
+        required: true
+        type: string
+        default: "10.67.79.170"
+      target_user:
+        description: "GMK EVO-X2 SSH user"
+        required: true
+        type: string
+        default: "jenkins"
       config:
         description: "Kernel matrix config path"
         required: true
         type: string
         default: "config/kernel-matrix.json"
       wait_timeout_minutes:
-        description: "Timeout used by wait mode"
+        description: "Timeout used by auto mode"
         required: true
         type: string
-        default: "180"
+        default: "240"
 
 permissions:
   contents: read
@@ -40,95 +48,141 @@ jobs:
   rocm_kernel_regression:
     name: ROCm kernel regression (${{ inputs.mode }})
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 240
+    timeout-minutes: 300
     defaults:
       run:
-        shell: bash
-        working-directory: /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression
+        shell: pwsh
 
     steps:
-      - name: Show host state
+      - name: Show controller state
         run: |
-          set -euxo pipefail
-          lsb_release -a || true
-          uname -a
-          pwd
-          systemctl is-enabled rocm-kernel-regression-resume.service || true
-          systemctl is-active rocm-kernel-regression-resume.service || true
+          $ErrorActionPreference = "Stop"
+          Write-Host "Controller: $env:COMPUTERNAME"
+          ssh -V
+          scp -V
 
-      - name: Start kernel matrix in background
-        if: inputs.mode == 'start'
+      - name: Check GMK host state
         run: |
-          set -euxo pipefail
-          sudo systemd-run \
-            --unit rocm-kernel-regression-start \
-            --collect \
-            --working-directory /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression \
-            /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression/scripts/orchestrate_kernel_matrix.py \
-              start \
-              --config "${{ inputs.config }}" \
-              --ci \
-              --force
-          echo "Started rocm-kernel-regression-start as a transient systemd unit."
-          echo "Use mode=wait or mode=collect after reboots complete."
+          $ErrorActionPreference = "Stop"
+          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.target_user }}@${{ inputs.target_host }}" `
+            "lsb_release -a 2>/dev/null || true; uname -a; systemctl is-enabled rocm-kernel-regression-resume.service; systemctl is-active rocm-kernel-regression-resume.service || true"
 
-      - name: Wait for active run
-        if: inputs.mode == 'wait'
+      - name: Start GMK kernel matrix
+        if: inputs.mode == 'auto'
         run: |
-          set -euxo pipefail
-          ./scripts/orchestrate_kernel_matrix.py wait \
-            --timeout-minutes "${{ inputs.wait_timeout_minutes }}"
+          $ErrorActionPreference = "Stop"
+          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" @'
+            set -euxo pipefail
+            cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression
+            sudo systemd-run \
+              --unit rocm-kernel-regression-start \
+              --collect \
+              --working-directory /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression \
+              /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression/scripts/orchestrate_kernel_matrix.py \
+                start \
+                --config "${{ inputs.config }}" \
+                --ci \
+                --force
+          '@
+
+      - name: Wait for GMK completion
+        if: inputs.mode == 'auto'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $deadline = (Get-Date).AddMinutes([int]"${{ inputs.wait_timeout_minutes }}")
+          while ((Get-Date) -lt $deadline) {
+            try {
+              $state = ssh -o ConnectTimeout=20 "${{ inputs.target_user }}@${{ inputs.target_host }}" "cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression && ./scripts/orchestrate_kernel_matrix.py status"
+              Write-Host $state
+              $json = $state | ConvertFrom-Json
+              if ($json.phase -in @("completed", "failed", "aborted")) {
+                $json.final_status | Out-File -FilePath gmk-final-status.txt -Encoding utf8
+                Write-Host "Run completed with final_status=$($json.final_status)"
+                exit 0
+              }
+            } catch {
+              Write-Host "GMK not reachable or status unavailable yet: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 30
+          }
+          throw "Timed out waiting for GMK kernel regression completion."
 
       - name: Print active run status
         if: inputs.mode == 'status'
         run: |
-          set -euxo pipefail
-          ./scripts/orchestrate_kernel_matrix.py status
+          $ErrorActionPreference = "Stop"
+          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" `
+            "cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression && ./scripts/orchestrate_kernel_matrix.py status"
 
       - name: Abort active run
         if: inputs.mode == 'abort'
         run: |
-          set -euxo pipefail
-          ./scripts/orchestrate_kernel_matrix.py abort
+          $ErrorActionPreference = "Stop"
+          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" `
+            "cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression && ./scripts/orchestrate_kernel_matrix.py abort"
 
-      - name: Generate or refresh latest report
-        if: inputs.mode == 'collect'
+      - name: Refresh report on GMK
+        if: inputs.mode == 'auto'
         run: |
-          set -euxo pipefail
-          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-github-collect"
-          mkdir -p "reports/${RUN_ID}"
-          STATE_ARGS=()
-          if [ -f ./state/current-run.json ]; then
-            STATE_ARGS=(--state ./state/current-run.json)
-          fi
-          python3 ./scripts/summarize_matrix.py \
-            --config "${{ inputs.config }}" \
-            "${STATE_ARGS[@]}" \
-            --output-dir "reports/${RUN_ID}"
-          rm -f reports/latest
-          ln -s "${RUN_ID}" reports/latest
+          $ErrorActionPreference = "Stop"
+          ssh "${{ inputs.target_user }}@${{ inputs.target_host }}" @'
+            set -euxo pipefail
+            cd /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression
+            RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-github-collect"
+            mkdir -p "reports/${RUN_ID}"
+            STATE_ARGS=()
+            if [ -f ./state/current-run.json ]; then
+              STATE_ARGS=(--state ./state/current-run.json)
+            fi
+            python3 ./scripts/summarize_matrix.py \
+              --config "${{ inputs.config }}" \
+              "${STATE_ARGS[@]}" \
+              --output-dir "reports/${RUN_ID}"
+            rm -f reports/latest
+            ln -s "${RUN_ID}" reports/latest
+          '@
+
+      - name: Download reports from GMK
+        if: inputs.mode == 'auto'
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path rocm-kernel-regression-report | Out-Null
+          scp -r "${{ inputs.target_user }}@${{ inputs.target_host }}:/home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression/reports/latest/*" rocm-kernel-regression-report/
 
       - name: Append job summary
-        if: inputs.mode == 'wait' || inputs.mode == 'collect' || inputs.mode == 'status'
+        if: inputs.mode == 'auto'
         run: |
-          set -euo pipefail
-          if [ -f reports/latest/summary.md ]; then
-            cat reports/latest/summary.md >> "${GITHUB_STEP_SUMMARY}"
-          elif [ -f state/current-run.json ]; then
-            {
-              echo "## ROCm Kernel Regression State"
-              echo '```json'
-              cat state/current-run.json
-              echo '```'
-            } >> "${GITHUB_STEP_SUMMARY}"
-          else
-            echo "No report or state file found." >> "${GITHUB_STEP_SUMMARY}"
-          fi
+          $ErrorActionPreference = "Stop"
+          $summary = "rocm-kernel-regression-report/summary.md"
+          if (Test-Path $summary) {
+            Get-Content $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } else {
+            "No summary.md found." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
 
       - name: Upload reports
-        if: inputs.mode == 'wait' || inputs.mode == 'collect'
+        if: inputs.mode == 'auto'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rocm-kernel-regression-report
-          path: /home/jenkins/dsy/IQE_SUZHOU/rocm-kernel-regression/reports/latest/
+          path: rocm-kernel-regression-report/
           if-no-files-found: warn
+
+      - name: Fail on regression
+        if: inputs.mode == 'auto'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $summaryPath = "rocm-kernel-regression-report/summary.json"
+          if (Test-Path $summaryPath) {
+            $summary = Get-Content $summaryPath | ConvertFrom-Json
+            if ($summary.final_status -ne "pass") {
+              throw "ROCm kernel regression final_status=$($summary.final_status)"
+            }
+          } elseif (Test-Path "gmk-final-status.txt") {
+            $status = (Get-Content "gmk-final-status.txt" | Select-Object -First 1).Trim()
+            if ($status -ne "pass") {
+              throw "ROCm kernel regression final_status=$status"
+            }
+          } else {
+            throw "No summary.json or final status file found."
+          }
